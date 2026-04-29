@@ -1,20 +1,13 @@
 """Worker for the Instant Meshes backend.
 
-Wraps Wenzel Jakob's Instant Meshes standalone binary
-(https://github.com/wjakob/instant-meshes/releases). Field-aligned quad/tri
-remesher with explicit target vertex count.
+Uses `pynanoinstantmeshes`, the Python bindings of Wenzel Jakob's Instant
+Meshes (no standalone binary required). Field-aligned quad/tri remesher
+with explicit target vertex count.
 
-Setup:
-  1. Download the binary release for your OS:
-     https://github.com/wjakob/instant-meshes/releases
-  2. Set its full path in the addon preferences ("Instant Meshes Exe").
-
-The binary path comes through --exe (resolved by the addon from prefs).
+Install in the venv: pip install pynanoinstantmeshes
 """
 import argparse
-import os
 import struct
-import subprocess
 import sys
 
 
@@ -74,7 +67,6 @@ def _read_ply(path):
                     idx = struct.unpack("<" + elem_fmt_char * n, f.read(elem_size * n))
                     if n == 3: faces_list.append(idx)
                     elif n == 4:
-                        # quad → fan triangulate
                         faces_list.append((idx[0], idx[1], idx[2]))
                         faces_list.append((idx[0], idx[2], idx[3]))
                     elif n > 4:
@@ -106,78 +98,93 @@ def _write_ply(path, vertices, faces):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Instant Meshes wrapper worker")
+    parser = argparse.ArgumentParser(description="Instant Meshes (pynanoinstantmeshes) worker")
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--exe", required=True,
-                        help="Full path to the Instant Meshes binary")
     parser.add_argument("--vertices", type=int, default=10000,
                         help="Target output vertex count")
-    parser.add_argument("--rosy", type=int, default=4, choices=[2, 4, 6],
+    parser.add_argument("--rosy", type=int, default=6, choices=[2, 4, 6],
                         help="Orientation symmetry (2/4/6); 4 = quads, 6 = tris")
-    parser.add_argument("--posy", type=int, default=4, choices=[4, 6],
+    parser.add_argument("--posy", type=int, default=6, choices=[4, 6],
                         help="Position symmetry (4 = quads, 6 = tris)")
-    parser.add_argument("--smooth", type=int, default=2,
+    parser.add_argument("--smooth-iter", type=int, default=2,
                         help="Smoothing iterations")
-    parser.add_argument("--crease", type=float, default=0.0,
-                        help="Crease angle in degrees (0 = none)")
+    parser.add_argument("--crease-angle", type=float, default=0.0,
+                        help="Crease angle threshold in degrees (0 = none)")
     parser.add_argument("--align-boundaries", action="store_true",
                         help="Align result to mesh boundaries")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
-    if not os.path.isfile(args.exe):
-        print(f"ERROR: Instant Meshes binary not found at: {args.exe}\n"
-              "Download from: https://github.com/wjakob/instant-meshes/releases\n"
-              "Then set its path in the addon preferences.", file=sys.stderr)
+    try:
+        import numpy as np
+    except ImportError as e:
+        print(f"ERROR: numpy not importable: {e}", file=sys.stderr); sys.exit(2)
+    try:
+        import pynanoinstantmeshes as pim
+    except ImportError as e:
+        print(f"ERROR: pynanoinstantmeshes not importable: {e}\n"
+              "Install in this venv with: pip install pynanoinstantmeshes", file=sys.stderr)
         sys.exit(2)
 
-    cmd = [
-        args.exe,
-        args.input,
-        "--output", args.output,
-        "--vertices", str(args.vertices),
-        "--rosy", str(args.rosy),
-        "--posy", str(args.posy),
-        "--smooth", str(args.smooth),
-        "--deterministic",
-    ]
-    if args.crease > 0:
-        cmd += ["--crease", str(args.crease)]
-    if args.align_boundaries:
-        cmd.append("--align-to-boundaries")
-
     if args.verbose:
-        print(f"[instant_meshes] running: {' '.join(cmd)}")
+        print(f"[instant_meshes] pynanoinstantmeshes ok, loading {args.input}")
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60 * 30)
-    except subprocess.TimeoutExpired:
-        print("ERROR: Instant Meshes timed out (30 min).", file=sys.stderr); sys.exit(7)
-    if args.verbose:
-        if proc.stdout: print(proc.stdout)
-        if proc.stderr: print(proc.stderr, file=sys.stderr)
-    if proc.returncode != 0:
-        print(f"ERROR: Instant Meshes exited with code {proc.returncode}\n"
-              f"stderr: {proc.stderr[-2000:]}", file=sys.stderr)
-        sys.exit(proc.returncode)
-    if not os.path.isfile(args.output):
-        print(f"ERROR: Instant Meshes did not produce {args.output}", file=sys.stderr)
-        sys.exit(8)
-
-    # Re-write the PLY through our writer to ensure binary_little_endian + tri
-    # layout that the Blender addon expects (Instant Meshes may emit quads).
-    try:
-        v, f = _read_ply(args.output)
+        np_v, np_f = _read_ply(args.input)
     except Exception as e:
-        print(f"ERROR: failed to re-read Instant Meshes PLY output: {e}", file=sys.stderr)
-        sys.exit(9)
+        print(f"ERROR: failed to read input PLY: {e}", file=sys.stderr); sys.exit(4)
+    if np_v.shape[0] == 0 or np_f.shape[0] == 0:
+        print("ERROR: empty input mesh", file=sys.stderr); sys.exit(4)
+
     if args.verbose:
-        print(f"[instant_meshes] output: {v.shape[0]} verts, {f.shape[0]} tris (after triangulation)")
+        print(f"[instant_meshes] input: {np_v.shape[0]} verts, {np_f.shape[0]} faces, "
+              f"target_v={args.vertices}, rosy={args.rosy}, posy={args.posy}")
+
     try:
-        _write_ply(args.output, v, f)
+        out_v, out_f = pim.remesh(
+            verts=np_v.astype(np.float32),
+            faces=np_f.astype(np.uint32),
+            vertex_count=int(args.vertices),
+            rosy=int(args.rosy),
+            posy=int(args.posy),
+            scale=-1.0,
+            face_count=-1,
+            creaseAngle=float(args.crease_angle),
+            align_to_boundaries=bool(args.align_boundaries),
+            extrinsic=True,
+            smooth_iter=int(args.smooth_iter),
+            knn_points=1000,
+            deterministic=True,
+        )
     except Exception as e:
-        print(f"ERROR: failed to rewrite output: {e}", file=sys.stderr); sys.exit(10)
+        print(f"ERROR: pynanoinstantmeshes.remesh failed: {e}", file=sys.stderr); sys.exit(7)
+
+    out_v = np.asarray(out_v, dtype=np.float32)
+    out_f_raw = np.asarray(out_f, dtype=np.int64)
+
+    # pynanoinstantmeshes can output quads (4 indices per face). If posy=4
+    # we'll get a (N, 4) array; triangulate before writing.
+    if out_f_raw.ndim == 2 and out_f_raw.shape[1] == 4:
+        # fan-triangulate quads -> tris
+        tris = np.empty((out_f_raw.shape[0] * 2, 3), dtype=np.int32)
+        tris[0::2, 0] = out_f_raw[:, 0]
+        tris[0::2, 1] = out_f_raw[:, 1]
+        tris[0::2, 2] = out_f_raw[:, 2]
+        tris[1::2, 0] = out_f_raw[:, 0]
+        tris[1::2, 1] = out_f_raw[:, 2]
+        tris[1::2, 2] = out_f_raw[:, 3]
+        out_f = tris
+    else:
+        out_f = out_f_raw.astype(np.int32)
+
+    if args.verbose:
+        print(f"[instant_meshes] output: {out_v.shape[0]} verts, {out_f.shape[0]} tris")
+
+    try:
+        _write_ply(args.output, out_v, out_f)
+    except Exception as e:
+        print(f"ERROR: failed to write output PLY: {e}", file=sys.stderr); sys.exit(6)
 
 
 if __name__ == "__main__":

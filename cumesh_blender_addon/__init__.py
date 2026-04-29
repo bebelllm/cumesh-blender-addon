@@ -40,13 +40,7 @@ class CUMESH_AddonPreferences(AddonPreferences):
 
     python_exe: StringProperty(
         name="External Python",
-        description="Path to a Python interpreter (venv) with torch + cumesh + (optional) manifold3d / pymeshfix / pymeshlab installed",
-        subtype="FILE_PATH",
-        default="",
-    )
-    instant_meshes_exe: StringProperty(
-        name="Instant Meshes Exe",
-        description="Path to the Instant Meshes binary (download from https://github.com/wjakob/instant-meshes/releases)",
+        description="Path to a Python interpreter (venv) with torch + cumesh + (optional) manifold3d / pymeshfix / pymeshlab / pynanoinstantmeshes installed",
         subtype="FILE_PATH",
         default="",
     )
@@ -58,9 +52,8 @@ class CUMESH_AddonPreferences(AddonPreferences):
         col.prop(self, "python_exe")
         col.label(text="Example: C:/envs/cumesh/Scripts/python.exe", icon="INFO")
         col.separator()
-        col.label(text="Instant Meshes binary path (only needed for that backend):")
-        col.prop(self, "instant_meshes_exe")
-        col.label(text="Download: https://github.com/wjakob/instant-meshes/releases", icon="URL")
+        col.label(text="Optional libs (install in the same venv as needed):", icon="INFO")
+        col.label(text="   pip install manifold3d pymeshfix pymeshlab pynanoinstantmeshes")
         col.separator()
         col.label(text=f"Workers folder: {os.path.dirname(_worker_path())}", icon="FILE_SCRIPT")
 
@@ -371,15 +364,14 @@ def _build_pymeshlab_args(settings, verbose):
     return args
 
 
-def _build_instantmeshes_args(settings, exe_path, verbose):
+def _build_instantmeshes_args(settings, verbose):
     rosy = 4 if settings.output_quads else 6
     posy = 4 if settings.output_quads else 6
-    args = ["--exe", exe_path,
-            "--vertices", str(settings.target_vertices),
+    args = ["--vertices", str(settings.target_vertices),
             "--rosy", str(rosy),
             "--posy", str(posy),
-            "--smooth", str(settings.smooth_iter),
-            "--crease", str(settings.crease_angle)]
+            "--smooth-iter", str(settings.smooth_iter),
+            "--crease-angle", str(settings.crease_angle)]
     if settings.align_boundaries:
         args.append("--align-boundaries")
     if verbose:
@@ -518,7 +510,7 @@ class CUMESH_OT_remesh(Operator):
 class CUMESH_OT_manifold(Operator):
     bl_idname = "cumesh.manifold_remesh"
     bl_label = "Manifold Remesh"
-    bl_description = "Run Manifold (elalish/manifold) on the active mesh — requires near-watertight input"
+    bl_description = "Run Manifold (elalish/manifold) on the active mesh — requires near-watertight input (run PyMeshFix first if not)"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -535,11 +527,34 @@ class CUMESH_OT_manifold(Operator):
         py_exe, worker = resolved
 
         src_obj = context.active_object
+
+        # Pre-check: Manifold requires watertight input (no boundary edges,
+        # no non-manifold edges). Catch this BEFORE spawning the subprocess
+        # so the user gets an actionable message instead of "code 5".
+        try:
+            stats = _compute_topology_stats(src_obj.data)
+            if stats["boundary"] > 0 or stats["non_manifold"] > 0:
+                self.report(
+                    {"ERROR"},
+                    f"Manifold requires watertight input. "
+                    f"'{src_obj.name}' has {stats['boundary']} boundary edges "
+                    f"and {stats['non_manifold']} non-manifold edges. "
+                    f"Run PyMeshFix Repair on this object first, then Manifold on the result.",
+                )
+                return {"CANCELLED"}
+        except Exception:
+            # If pre-check fails, fall through to the worker — it has its own checks.
+            pass
+
         new_mesh, err = _run_pipeline(
             context, src_obj, py_exe, worker,
             _build_manifold_args(ms, s.verbose), label="Manifold",
         )
         if err:
+            # Translate the worker's exit code 5 to something more actionable
+            if "code 5" in err:
+                err = (err + " Manifold requires a watertight input — run PyMeshFix Repair "
+                              "on this object first.")
             self.report({"ERROR"}, err); return {"CANCELLED"}
 
         new_obj = _create_result_obj(context, src_obj, new_mesh, "manifold", "manifold")
@@ -604,7 +619,7 @@ class CUMESH_OT_pymeshlab(Operator):
 class CUMESH_OT_instantmeshes(Operator):
     bl_idname = "cumesh.instantmeshes_remesh"
     bl_label = "Instant Meshes"
-    bl_description = "Run Wenzel Jakob's Instant Meshes binary (field-aligned remesher, GPL)"
+    bl_description = "Run Wenzel Jakob's Instant Meshes via pynanoinstantmeshes (field-aligned remesher, GPL)"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -616,16 +631,6 @@ class CUMESH_OT_instantmeshes(Operator):
         s = context.scene.cumesh_settings
         ims = context.scene.instantmeshes_settings
 
-        # Validate Instant Meshes binary path
-        raw_exe = (prefs.instant_meshes_exe or "").strip()
-        im_exe = bpy.path.abspath(raw_exe) if raw_exe else ""
-        if not raw_exe:
-            self.report({"ERROR"}, "Instant Meshes: 'Instant Meshes Exe' is empty in preferences. Download from https://github.com/wjakob/instant-meshes/releases")
-            return {"CANCELLED"}
-        if not os.path.isfile(im_exe):
-            self.report({"ERROR"}, f"Instant Meshes binary not found at: {im_exe}")
-            return {"CANCELLED"}
-
         resolved, err = _resolve_python(prefs, "instant_meshes_worker.py")
         if err:
             self.report({"ERROR"}, "Instant Meshes: " + err); return {"CANCELLED"}
@@ -634,9 +639,15 @@ class CUMESH_OT_instantmeshes(Operator):
         src_obj = context.active_object
         new_mesh, err = _run_pipeline(
             context, src_obj, py_exe, worker,
-            _build_instantmeshes_args(ims, im_exe, s.verbose), label="InstantMeshes",
+            _build_instantmeshes_args(ims, s.verbose), label="InstantMeshes",
         )
         if err:
+            # 0xC0000409 = STATUS_STACK_BUFFER_OVERRUN, common pynanoinstantmeshes
+            # crash on dense/noisy inputs — translate to friendly hint
+            if "3221226505" in err or "0xC0000409" in err.upper():
+                err = (err + " [pynanoinstantmeshes C++ crashed during position-field optimization. "
+                              "Try: lower 'Target Vertices', pre-clean with PyMeshFix, "
+                              "or use PyMeshLab Isotropic instead.]")
             self.report({"ERROR"}, err); return {"CANCELLED"}
 
         new_obj = _create_result_obj(context, src_obj, new_mesh, "instantmeshes", "instantmeshes")
@@ -733,7 +744,6 @@ class CUMESH_OT_refresh(Operator):
             "instantmeshes": ("instant_meshes_worker.py",
                               _build_instantmeshes_args(
                                   context.scene.instantmeshes_settings,
-                                  bpy.path.abspath(prefs.instant_meshes_exe or ""),
                                   settings.verbose),
                               "InstantMeshes"),
         }
